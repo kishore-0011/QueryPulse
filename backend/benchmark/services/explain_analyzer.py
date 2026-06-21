@@ -27,12 +27,17 @@ class ExplainAnalyzer:
 
             plan = result[0]
             plan_summary = plan[0]
+            root_plan = plan_summary.get("Plan", {})
 
             query_plan = QueryPlan.objects.create(
                 benchmark=benchmark,
                 plan=plan,
                 planning_time=plan_summary["Planning Time"],
                 execution_time=plan_summary["Execution Time"],
+                startup_cost=root_plan.get("Startup Cost"),
+                total_cost=root_plan.get("Total Cost"),
+                plan_rows=root_plan.get("Plan Rows"),
+                actual_rows=root_plan.get("Actual Rows"),
             )
             findings = PlanAnalyzer().analyze(query_plan.plan, query)
             Recommendation.objects.bulk_create(

@@ -1,7 +1,19 @@
 from django.db import models
 
 
+class BenchmarkSession(models.Model):
+    name = models.CharField(max_length=255)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
 class Benchmark(models.Model):
+    session = models.ForeignKey(
+        BenchmarkSession,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="benchmarks",
+    )
     query = models.TextField()
     execution_time_ms = models.FloatField(null=True, blank=True)
     rows_returned = models.IntegerField(null=True, blank=True)
@@ -18,6 +30,10 @@ class QueryPlan(models.Model):
     plan = models.JSONField()
     planning_time = models.FloatField()
     execution_time = models.FloatField()
+    startup_cost = models.FloatField(null=True, blank=True)
+    total_cost = models.FloatField(null=True, blank=True)
+    plan_rows = models.IntegerField(null=True, blank=True)
+    actual_rows = models.IntegerField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
 

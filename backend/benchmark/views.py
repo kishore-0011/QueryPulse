@@ -3,9 +3,11 @@ from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
-from .models import Benchmark
+from django.db.models import Count, Min, Max
+
+from .models import Benchmark, BenchmarkSession, Recommendation
 from .serializers import BenchmarkRequestSerializer
-from .services import ExplainAnalyzer, PlanAnalyzer, QueryRunner
+from .services import ExplainAnalyzer, PlanAnalyzer, PlanTreeBuilder, QueryRunner
 
 
 @api_view(["GET"])
@@ -41,12 +43,16 @@ def benchmark_detail(request, benchmark_id):
     )
 
     recommendations = []
+    node_type = None
     query_plan = getattr(benchmark, "query_plan", None)
     if query_plan is not None:
         recommendations = [
             _serialize_recommendation(recommendation)
             for recommendation in query_plan.recommendations.all()
         ]
+        plan = getattr(query_plan, "plan", None)
+        if plan:
+            node_type = PlanAnalyzer().get_root_node_type(plan)
 
     return Response(
         {
@@ -54,6 +60,8 @@ def benchmark_detail(request, benchmark_id):
             "query": benchmark.query,
             "execution_time_ms": round(benchmark.execution_time_ms or 0, 2),
             "rows_returned": benchmark.rows_returned or 0,
+            "node_type": node_type,
+            "cost_metrics": _serialize_cost_metrics(query_plan),
             "recommendations": recommendations,
         },
         status=status.HTTP_200_OK,
@@ -73,6 +81,21 @@ def _serialize_recommendation(recommendation):
     if recommendation.improvement_percent is not None:
         data["improvement_percent"] = recommendation.improvement_percent
     return data
+
+
+def _serialize_cost_metrics(query_plan):
+    if query_plan is None:
+        return None
+    data = {}
+    if query_plan.startup_cost is not None:
+        data["startup_cost"] = query_plan.startup_cost
+    if query_plan.total_cost is not None:
+        data["total_cost"] = query_plan.total_cost
+    if query_plan.plan_rows is not None:
+        data["plan_rows"] = query_plan.plan_rows
+    if query_plan.actual_rows is not None:
+        data["actual_rows"] = query_plan.actual_rows
+    return data or None
 
 
 def _serialize_benchmark_comparison(benchmark):
@@ -98,6 +121,7 @@ def _serialize_benchmark_comparison(benchmark):
         "rows_returned": benchmark.rows_returned or 0,
         "planning_time": round(planning_time or 0, 2) if planning_time is not None else None,
         "node_types": node_types,
+        "cost_metrics": _serialize_cost_metrics(query_plan),
         "recommendations": recommendations,
     }
 
@@ -177,6 +201,109 @@ def explain_benchmark(request):
         {
             "benchmark_id": query_plan.benchmark.id,
             "status": query_plan.benchmark.status,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET"])
+def benchmark_plan(request, benchmark_id):
+    benchmark = get_object_or_404(
+        Benchmark.objects.select_related("query_plan"), pk=benchmark_id
+    )
+    query_plan = getattr(benchmark, "query_plan", None)
+    plan = getattr(query_plan, "plan", None) if query_plan is not None else None
+
+    tree = PlanTreeBuilder().build(plan)
+    if tree is None:
+        return Response(
+            {"detail": "No query plan available for this benchmark."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    return Response(tree, status=status.HTTP_200_OK)
+
+
+@api_view(["GET"])
+def session_list(request):
+    sessions = BenchmarkSession.objects.order_by("-created_at")
+    return Response(
+        [
+            {
+                "id": session.id,
+                "name": session.name,
+                "created_at": session.created_at,
+                "benchmark_count": session.benchmarks.count(),
+            }
+            for session in sessions
+        ],
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET"])
+def session_detail(request, session_id):
+    session = get_object_or_404(
+        BenchmarkSession.objects.prefetch_related("benchmarks__query_plan"),
+        pk=session_id,
+    )
+    benchmarks = session.benchmarks.order_by("created_at")
+
+    return Response(
+        {
+            "id": session.id,
+            "name": session.name,
+            "created_at": session.created_at,
+            "benchmarks": [
+                _serialize_benchmark_comparison(b) for b in benchmarks
+            ],
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET"])
+def session_summary(request, session_id):
+    session = get_object_or_404(
+        BenchmarkSession.objects.prefetch_related(
+            "benchmarks__query_plan__recommendations"
+        ),
+        pk=session_id,
+    )
+    benchmarks = list(session.benchmarks.order_by("created_at"))
+
+    benchmark_count = len(benchmarks)
+    before_execution_time = benchmarks[0].execution_time_ms if benchmarks else None
+    after_execution_time = benchmarks[-1].execution_time_ms if benchmarks else None
+
+    if before_execution_time and after_execution_time is not None:
+        improvement_percent = round(
+            ((before_execution_time - after_execution_time) / before_execution_time)
+            * 100,
+            2,
+        )
+    else:
+        improvement_percent = None
+
+    recommendation_count = sum(
+        query_plan.recommendations.count()
+        for b in benchmarks
+        if (query_plan := getattr(b, "query_plan", None)) is not None
+    )
+
+    return Response(
+        {
+            "session_id": session.id,
+            "session_name": session.name,
+            "benchmark_count": benchmark_count,
+            "before_execution_time_ms": (
+                round(before_execution_time, 2) if before_execution_time is not None else None
+            ),
+            "after_execution_time_ms": (
+                round(after_execution_time, 2) if after_execution_time is not None else None
+            ),
+            "improvement_percent": improvement_percent,
+            "recommendation_count": recommendation_count,
         },
         status=status.HTTP_200_OK,
     )
