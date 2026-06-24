@@ -3,11 +3,20 @@ from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
+from django.db import connection
 from django.db.models import Count, Min, Max
 
 from .models import Benchmark, BenchmarkSession, Recommendation
 from .serializers import BenchmarkRequestSerializer
-from .services import ExplainAnalyzer, PlanAnalyzer, PlanTreeBuilder, QueryRunner
+from .services import (
+    DatasetGenerationService,
+    EnvironmentTemplateService,
+    ExplainAnalyzer,
+    PlanAnalyzer,
+    PlanTreeBuilder,
+    QueryRunner,
+    TableCreationService,
+)
 
 
 @api_view(["GET"])
@@ -242,6 +251,36 @@ def session_list(request):
 
 
 @api_view(["GET"])
+def recommendation_list(request):
+    recommendations = Recommendation.objects.select_related(
+        "query_plan__benchmark__session"
+    ).order_by("-created_at")
+
+    return Response(
+        [
+            {
+                "id": r.id,
+                "type": r.rule_type,
+                "severity": r.severity,
+                "message": r.message,
+                "before_execution_time": r.before_execution_time,
+                "after_execution_time": r.after_execution_time,
+                "improvement_percent": r.improvement_percent,
+                "benchmark_id": r.query_plan.benchmark.id,
+                "session_id": r.query_plan.benchmark.session.id
+                if r.query_plan.benchmark.session
+                else None,
+                "session_name": r.query_plan.benchmark.session.name
+                if r.query_plan.benchmark.session
+                else None,
+            }
+            for r in recommendations
+        ],
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET"])
 def session_detail(request, session_id):
     session = get_object_or_404(
         BenchmarkSession.objects.prefetch_related("benchmarks__query_plan"),
@@ -338,4 +377,143 @@ def run_benchmark(request):
             "status": benchmark.status,
         },
         status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET"])
+def environment(request):
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_type = 'BASE TABLE'
+              AND table_name NOT LIKE 'auth_%'
+              AND table_name NOT LIKE 'django_%'
+            ORDER BY table_name
+            """
+        )
+        table_names = [r[0] for r in cursor.fetchall()]
+
+    tables = []
+    for name in table_names:
+        with connection.cursor() as cursor:
+            cursor.execute(f'SELECT COUNT(*) FROM "{name}"')
+            row_count = cursor.fetchone()[0]
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT indexname, indexdef
+                FROM pg_indexes
+                WHERE tablename = %s AND schemaname = 'public'
+                ORDER BY indexname
+                """,
+                [name],
+            )
+            indexes = [{"name": r[0], "definition": r[1]} for r in cursor.fetchall()]
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT column_name, data_type, is_nullable, column_default
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                [name],
+            )
+            columns = [
+                {
+                    "name": r[0],
+                    "type": r[1],
+                    "nullable": r[2] == "YES",
+                    "default": r[3],
+                }
+                for r in cursor.fetchall()
+            ]
+
+        with connection.cursor() as cursor:
+            cursor.execute(f'SELECT * FROM "{name}" LIMIT 5')
+            sample_rows = [dict(zip([c[0] for c in cursor.description], row)) for row in cursor.fetchall()]
+
+        tables.append(
+            {
+                "name": name,
+                "row_count": row_count,
+                "indexes": indexes,
+                "columns": columns,
+                "sample_rows": sample_rows,
+            }
+        )
+
+    return Response({"tables": tables})
+
+
+@api_view(["POST"])
+def generate_table_data(request, table_name):
+    rows = request.data.get("rows", 0)
+    if not isinstance(rows, int) or rows < 1:
+        return Response(
+            {"error": "rows must be a positive integer."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    service = DatasetGenerationService(table_name)
+    try:
+        created = service.generate(rows)
+    except ValueError as exc:
+        return Response(
+            {"error": str(exc)},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    return Response(
+        {
+            "table": table_name,
+            "rows_created": created,
+            "status": "SUCCESS",
+        },
+        status=status.HTTP_201_CREATED,
+    )
+
+
+@api_view(["POST"])
+def create_table(request):
+    table_name = request.data.get("table_name", "")
+    columns = request.data.get("columns", [])
+
+    service = TableCreationService(table_name, columns)
+    try:
+        result = service.create()
+    except ValueError as exc:
+        return Response(
+            {"error": str(exc)},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    return Response(result, status=status.HTTP_201_CREATED)
+
+
+@api_view(["POST"])
+def apply_template(request):
+    template = request.data.get("template", "")
+
+    service = EnvironmentTemplateService(template)
+    try:
+        tables_created = service.apply()
+    except ValueError as exc:
+        return Response(
+            {"error": str(exc)},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    return Response(
+        {
+            "template": template,
+            "tables_created": tables_created,
+            "status": "SUCCESS",
+        },
+        status=status.HTTP_201_CREATED,
     )
